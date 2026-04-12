@@ -1,9 +1,9 @@
 import random
 import string
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-TOKEN = "8762120219:AAHeN_DjtVvn5QI1R6pTHC_4qobtnXVgTy4"
+TOKEN = "توکن خودتو بذار"
 ADMIN = 33872273
 WALLET = "0x53ed8e2548924B8B20037BBB33098aba7b89bE0D"
 
@@ -13,16 +13,19 @@ PLANS = {
     "p20": ("20GB", "55$")
 }
 
+USERS = set()
+
 def order_code():
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    chars = string.ascii_uppercase + string.digits
+    return "".join(random.choice(chars) for _ in range(6))
 
-def menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 پلن‌ها", callback_data="plans")],
-        [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")]
-    ])
+def main_menu():
+    keyboard = [
+        ["📦 پلن‌ها", "📞 پشتیبانی"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def plans():
+def plans_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 5GB - 19$", callback_data="p5")],
         [InlineKeyboardButton("📦 10GB - 33$", callback_data="p10")],
@@ -30,117 +33,133 @@ def plans():
         [InlineKeyboardButton("🔙 بازگشت", callback_data="back")]
     ])
 
-def reply_btn(uid):
+def reply_btn(user_id):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✉️ پاسخ", callback_data=f"reply_{uid}")]
+        [InlineKeyboardButton("✉️ پاسخ", callback_data=f"reply_{user_id}")]
     ])
 
-def order_btns(uid):
+def order_btns(user_id):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✉️ پاسخ", callback_data=f"reply_{uid}"),
-            InlineKeyboardButton("✅ تایید", callback_data=f"ok_{uid}"),
-            InlineKeyboardButton("❌ رد", callback_data=f"no_{uid}")
+            InlineKeyboardButton("✉️ پاسخ", callback_data=f"reply_{user_id}"),
+            InlineKeyboardButton("✅ تایید", callback_data=f"ok_{user_id}"),
+            InlineKeyboardButton("❌ رد", callback_data=f"no_{user_id}")
         ]
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    USERS.add(user_id)
+
     context.user_data.clear()
-    await update.message.reply_text("سلام 👋\nبه ربات فروش VPN خوش اومدی.", reply_markup=menu())
+    await update.message.reply_text(
+        "سلام 👋\nبه ربات فروش VPN خوش اومدی.",
+        reply_markup=main_menu()
+    )
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN:
+        return
+
+    text = " ".join(context.args)
+
+    for user in USERS:
+        try:
+            await context.bot.send_message(user, text)
+        except:
+            pass
+
+    await update.message.reply_text("✅ پیام برای همه ارسال شد")
 
 async def click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     d = q.data
+    admin_id = q.from_user.id
 
-    if d.startswith("reply_") and q.from_user.id == ADMIN:
-        context.user_data["reply_to"] = int(d.split("_")[1])
+    if d.startswith("reply_") and admin_id == ADMIN:
+        target = int(d.split("_")[1])
+        context.user_data["reply_to"] = target
         await q.message.reply_text("✍️ جواب رو بفرست")
         return
 
-    if d.startswith("ok_") and q.from_user.id == ADMIN:
-        uid = int(d.split("_")[1])
+    if d.startswith("ok_") and admin_id == ADMIN:
+        target = int(d.split("_")[1])
         code = order_code()
-        await context.bot.send_message(uid, f"✅ پرداخت تایید شد\nکد سفارش: {code}")
-        await q.message.reply_text("✅ تایید شد")
+        await context.bot.send_message(target, f"✅ تایید شد\nکد: {code}")
         return
 
-    if d.startswith("no_") and q.from_user.id == ADMIN:
-        uid = int(d.split("_")[1])
-        await context.bot.send_message(uid, "❌ پرداخت رد شد")
-        await q.message.reply_text("❌ رد شد")
+    if d.startswith("no_") and admin_id == ADMIN:
+        target = int(d.split("_")[1])
+        await context.bot.send_message(target, "❌ پرداخت رد شد")
         return
 
-    context.user_data.clear()
+    if d == "back":
+        await q.edit_message_text("برگشتی به منو")
+        return
 
-    if d == "plans":
-        await q.edit_message_text("پلن رو انتخاب کن:", reply_markup=plans())
-
-    elif d == "support":
-        context.user_data["mode"] = "support"
-        await q.edit_message_text("پیامتو بفرست")
-
-    elif d == "back":
-        await q.edit_message_text("سلام 👋", reply_markup=menu())
-
-    elif d in PLANS:
+    if d in PLANS:
         name, price = PLANS[d]
         context.user_data["mode"] = "pay"
-        context.user_data["plan"] = d
-        await q.edit_message_text(f"{name} - {price}\n\n{WALLET}\n\nهش رو بفرست")
+        await q.edit_message_text(
+            f"پلن: {name}\nقیمت: {price}\n\nهش تراکنش رو بفرست"
+        )
 
 async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    if text == "📦 پلن‌ها":
+        await update.message.reply_text("انتخاب کن:", reply_markup=plans_menu())
+        return
+
+    if text == "📞 پشتیبانی":
+        context.user_data["mode"] = "support"
+        await update.message.reply_text("پیامتو بفرست")
+        return
+
     u = update.effective_user
     uid = u.id
     username = f"@{u.username}" if u.username else "ندارد"
     mode = context.user_data.get("mode")
 
-    # جواب ادمین
     if uid == ADMIN and context.user_data.get("reply_to"):
         target = context.user_data["reply_to"]
-        await context.bot.send_message(target, update.message.text)
-        context.user_data.pop("reply_to")
+        await context.bot.send_message(target, f"📩 پاسخ:\n{text}")
+        context.user_data.pop("reply_to", None)
         return
 
     if mode == "support":
         await context.bot.send_message(
             ADMIN,
-            f"📩 پشتیبانی\n{u.full_name}\n{uid}\n{username}\n\n{update.message.text}",
+            f"📩 پیام\n{u.full_name}\n{username}\n{text}",
             reply_markup=reply_btn(uid)
         )
         await update.message.reply_text("ارسال شد")
+        return
 
-    elif mode == "pay":
-        context.user_data["tx"] = update.message.text
+    if mode == "pay":
+        context.user_data["tx"] = text
         context.user_data["mode"] = "receipt"
-        await update.message.reply_text("عکس فیش رو بفرست")
-
-    else:
-        await update.message.reply_text("از منو استفاده کن")
+        await update.message.reply_text("حالا عکس بفرست")
 
 async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     uid = u.id
     username = f"@{u.username}" if u.username else "ندارد"
-    mode = context.user_data.get("mode")
 
-    if mode == "receipt":
-        tx = context.user_data.get("tx", "")
-        plan = context.user_data.get("plan")
-
+    if context.user_data.get("mode") == "receipt":
         await context.bot.send_photo(
             ADMIN,
             update.message.photo[-1].file_id,
-            caption=f"🚨 سفارش\n{u.full_name}\n{uid}\n{username}\n{PLANS[plan]}\n{tx}",
+            caption=f"{u.full_name}\n{username}",
             reply_markup=order_btns(uid)
         )
-
-        await update.message.reply_text("ارسال شد")
-        context.user_data.clear()
+        await update.message.reply_text("ثبت شد")
 
 app = Application.builder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CallbackQueryHandler(click))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
 app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
