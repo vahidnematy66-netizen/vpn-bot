@@ -3,7 +3,7 @@ import string
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-TOKEN = "توکن خودتو بذار"
+TOKEN = "8762120219:AAHeN_DjtVvn5QI1R6pTHC_4qobtnXVgTy4"
 ADMIN = 33872273
 WALLET = "0x53ed8e2548924B8B20037BBB33098aba7b89bE0D"
 
