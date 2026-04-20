@@ -3,7 +3,7 @@ import random
 import string
 import logging
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Tuple
 
 import requests
 from telegram import (
@@ -22,16 +22,16 @@ from telegram.ext import (
 )
 
 # =========================
-# Config
+# CONFIG
 # =========================
 
 TOKEN = "8762120219:AAHeN_DjtVvn5QI1R6pTHC_4qobtnXVgTy4"
 ADMIN = 33872273
-NOWPAYMENTS_API_KEY = "N3H3MN5-JCKMMMW-G5MEPGY-6HK4ET3"
+OXAPAY_MERCHANT_API_KEY = "T3WZ58-ZVMEA7-CFBDPD-UIOKGI"
+BOT_USERNAME = "iranconnect_bot"
 
 DB_PATH = "bot_data.db"
-NOW_BASE = "https://api.nowpayments.io/v1"
-
+OXAPAY_BASE = "https://api.oxapay.com/v1"
 ECONOMY_ACCESS_CODE = "netazadi_eghtesadi"
 
 logging.basicConfig(
@@ -41,7 +41,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =========================
-# Plans
+# PLANS
 # =========================
 
 PLAN_CATEGORIES = {
@@ -67,15 +67,8 @@ PLAN_CATEGORIES = {
     },
 }
 
-PAY_CURRENCIES = {
-    "usdttrc20": "USDT (TRC20)",
-    "usdtbsc": "USDT (BSC)",
-    "ltc": "Litecoin (LTC)",
-    "btc": "Bitcoin (BTC)",
-}
-
-FINAL_SUCCESS_STATUSES = {"confirmed", "sending", "finished"}
-
+FINAL_SUCCESS_STATUSES = {"paid"}
+FAILED_STATUSES = {"failed", "expired", "cancelled"}
 
 # =========================
 # DB
@@ -113,13 +106,9 @@ def init_db():
             plan_key TEXT,
             plan_name TEXT,
             price_usd TEXT,
-            pay_currency TEXT,
-            pay_currency_label TEXT,
-            np_payment_id TEXT,
-            payment_status TEXT DEFAULT 'waiting',
-            pay_address TEXT,
-            pay_amount TEXT,
-            payin_extra_id TEXT,
+            track_id TEXT,
+            payment_url TEXT,
+            payment_status TEXT DEFAULT 'new',
             order_code TEXT,
             is_notified INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -140,13 +129,9 @@ def init_db():
         "plan_key": "TEXT",
         "plan_name": "TEXT",
         "price_usd": "TEXT",
-        "pay_currency": "TEXT",
-        "pay_currency_label": "TEXT",
-        "np_payment_id": "TEXT",
-        "payment_status": "TEXT DEFAULT 'waiting'",
-        "pay_address": "TEXT",
-        "pay_amount": "TEXT",
-        "payin_extra_id": "TEXT",
+        "track_id": "TEXT",
+        "payment_url": "TEXT",
+        "payment_status": "TEXT DEFAULT 'new'",
         "order_code": "TEXT",
         "is_notified": "INTEGER DEFAULT 0",
         "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
@@ -187,11 +172,7 @@ def user_has_economy_access(user_id: int) -> bool:
 def grant_economy_access(user_id: int):
     conn = db()
     cur = conn.cursor()
-    cur.execute("""
-        UPDATE users
-        SET economy_access = 1
-        WHERE user_id = ?
-    """, (user_id,))
+    cur.execute("UPDATE users SET economy_access = 1 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -211,26 +192,20 @@ def create_order(
     plan_key: str,
     plan_name: str,
     price_usd: str,
-    pay_currency: str,
-    pay_currency_label: str,
-    np_payment_id: str,
-    pay_address: str,
-    pay_amount: str,
-    payin_extra_id: Optional[str] = None,
+    track_id: str,
+    payment_url: str,
 ):
     conn = db()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO orders (
-            user_id, category_key, plan_key, plan_name, price_usd,
-            pay_currency, pay_currency_label, np_payment_id,
-            pay_address, pay_amount, payin_extra_id
+            user_id, category_key, plan_key, plan_name,
+            price_usd, track_id, payment_url
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
-        user_id, category_key, plan_key, plan_name, price_usd,
-        pay_currency, pay_currency_label, np_payment_id,
-        pay_address, pay_amount, payin_extra_id
+        user_id, category_key, plan_key, plan_name,
+        price_usd, track_id, payment_url
     ))
     order_id = cur.lastrowid
     conn.commit()
@@ -241,7 +216,12 @@ def create_order(
 def get_order_by_id(order_id: int):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+    cur.execute("""
+        SELECT id, user_id, category_key, plan_key, plan_name, price_usd,
+               track_id, payment_url, payment_status, order_code, is_notified
+        FROM orders
+        WHERE id = ?
+    """, (order_id,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -251,10 +231,9 @@ def get_pending_orders():
     conn = db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, user_id, plan_name, price_usd, pay_currency, pay_currency_label,
-               np_payment_id, payment_status, order_code, is_notified
+        SELECT id, user_id, plan_name, price_usd, track_id, payment_status, order_code, is_notified
         FROM orders
-        WHERE payment_status NOT IN ('confirmed', 'sending', 'finished', 'failed', 'expired', 'refunded')
+        WHERE payment_status NOT IN ('paid', 'failed', 'expired', 'cancelled')
     """)
     rows = cur.fetchall()
     conn.close()
@@ -301,7 +280,7 @@ def get_order_notification_state(order_id: int):
     conn = db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT user_id, plan_name, price_usd, pay_currency_label, payment_status, order_code, is_notified
+        SELECT user_id, plan_name, price_usd, payment_status, order_code, is_notified
         FROM orders
         WHERE id = ?
     """, (order_id,))
@@ -311,7 +290,7 @@ def get_order_notification_state(order_id: int):
 
 
 # =========================
-# Helpers
+# HELPERS
 # =========================
 
 def ticket_code():
@@ -326,11 +305,21 @@ def main_menu():
     )
 
 
+def welcome_text():
+    return (
+        "🌐 به ربات رسمی نت‌آزادی خوش اومدی\n\n"
+        "✨ خرید سریع و امن پلن‌های VPN\n"
+        "💎 پرداخت با رمزارزها\n"
+        "🤖 تایید خودکار پرداخت\n"
+        "🎫 دریافت Ticket ID بعد از پرداخت\n\n"
+        "برای شروع از منوی پایین استفاده کن 👇"
+    )
+
+
 def categories_menu(user_id: int):
     rows = [
         [InlineKeyboardButton("⭐ پلن VIP", callback_data="cat_vip")]
     ]
-
     if user_has_economy_access(user_id):
         rows.append([InlineKeyboardButton("💎 پکیج اقتصادی", callback_data="cat_eco")])
 
@@ -343,40 +332,30 @@ def category_plans_menu(category_key: str):
     rows = []
 
     for plan_key, item in category["plans"].items():
-        label = f'{category["emoji"]} {item["name"]} - {item["price_usd"]} USDT'
+        label = f'{category["emoji"]} {item["name"]} - {item["price_usd"]} USD'
         rows.append([InlineKeyboardButton(label, callback_data=f"plan_{plan_key}")])
 
-    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="show_categories")])
+    rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="show_categories")])
     return InlineKeyboardMarkup(rows)
 
 
-def currency_menu():
+def pay_method_menu(order_id: int, payment_url: str):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💵 USDT (TRC20)", callback_data="pay_usdttrc20")],
-        [InlineKeyboardButton("💵 USDT (BSC)", callback_data="pay_usdtbsc")],
-        [InlineKeyboardButton("⚡ Litecoin (LTC)", callback_data="pay_ltc")],
-        [InlineKeyboardButton("🟠 Bitcoin (BTC)", callback_data="pay_btc")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="show_categories")],
+        [InlineKeyboardButton("💳 پرداخت با کریپتوکارنسی (رمزارزها)", url=payment_url)],
+        [InlineKeyboardButton("🔎 بررسی وضعیت پرداخت", callback_data=f"checkpay_{order_id}")],
+        [InlineKeyboardButton("⬅️ بازگشت به پلن‌ها", callback_data="show_categories")],
     ])
 
 
 def support_back_btn():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="show_categories")]
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="show_categories")]
     ])
 
 
 def reply_btn(user_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✉️ پاسخ", callback_data=f"reply_{user_id}")]
-    ])
-
-
-def post_payment_buttons(order_id: int):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 بررسی وضعیت پرداخت", callback_data=f"checkpay_{order_id}")],
-        [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="show_categories")],
     ])
 
 
@@ -394,36 +373,61 @@ def find_category_by_plan(plan_key: str) -> Optional[str]:
     return None
 
 
-def get_plan(plan_key: str):
+def get_plan(plan_key: str) -> Tuple[Optional[str], Optional[dict]]:
     cat_key = find_category_by_plan(plan_key)
     if not cat_key:
         return None, None
     return cat_key, PLAN_CATEGORIES[cat_key]["plans"][plan_key]
 
 
+def return_url():
+    return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else None
+
+
+def extract_invoice_fields(resp_json: dict) -> Tuple[str, str]:
+    data = resp_json.get("data") if isinstance(resp_json.get("data"), dict) else resp_json
+    track_id = data.get("track_id") or data.get("trackId") or ""
+    payment_url = data.get("payment_url") or data.get("payLink") or ""
+    return str(track_id), str(payment_url)
+
+
+def extract_status(resp_json: dict) -> str:
+    data = resp_json.get("data") if isinstance(resp_json.get("data"), dict) else resp_json
+    status = data.get("status", "new")
+    return str(status).lower()
+
+
 # =========================
-# NOWPayments API
+# OXAPAY API
 # =========================
 
-def np_headers():
+def oxa_headers():
     return {
-        "x-api-key": NOWPAYMENTS_API_KEY,
+        "merchant_api_key": OXAPAY_MERCHANT_API_KEY,
         "Content-Type": "application/json",
     }
 
 
-def create_nowpayment(price_amount: str, pay_currency: str, order_ref: str, order_description: str):
+def create_oxapay_invoice(amount_usd: str, order_ref: str, description: str):
     payload = {
-        "price_amount": float(price_amount),
-        "price_currency": "usd",
-        "pay_currency": pay_currency,
+        "amount": float(amount_usd),
+        "currency": "USD",
+        "lifetime": 60,
+        "fee_paid_by_payer": 1,
+        "mixed_payment": True,
+        "return_url": return_url(),
+        "thanks_message": "Thanks for your payment!",
+        "description": description,
         "order_id": order_ref,
-        "order_description": order_description,
+        "sandbox": False,
     }
 
+    if not payload["return_url"]:
+        payload.pop("return_url", None)
+
     r = requests.post(
-        f"{NOW_BASE}/payment",
-        headers=np_headers(),
+        f"{OXAPAY_BASE}/payment/invoice",
+        headers=oxa_headers(),
         json=payload,
         timeout=30,
     )
@@ -431,10 +435,10 @@ def create_nowpayment(price_amount: str, pay_currency: str, order_ref: str, orde
     return r.json()
 
 
-def get_nowpayment_status(payment_id: str):
+def get_oxapay_payment_info(track_id: str):
     r = requests.get(
-        f"{NOW_BASE}/payment/{payment_id}",
-        headers=np_headers(),
+        f"{OXAPAY_BASE}/payment/{track_id}",
+        headers=oxa_headers(),
         timeout=30,
     )
     r.raise_for_status()
@@ -442,7 +446,7 @@ def get_nowpayment_status(payment_id: str):
 
 
 # =========================
-# Bot handlers
+# BOT HANDLERS
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,9 +455,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
-        "سلام 👋\nبه ربات فروش VPN خوش اومدی.\n\n"
-        "از منوی زیر دسته‌بندی موردنظرت رو انتخاب کن:",
-        reply_markup=main_menu()
+        welcome_text(),
+        reply_markup=main_menu(),
     )
     await update.message.reply_text(
         "📦 دسته‌بندی پلن‌ها:",
@@ -511,8 +514,7 @@ async def click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         context.user_data["mode"] = "support"
         await q.message.edit_text(
-            "📞 پیام پشتیبانی‌ات را بفرست.\n"
-            "اگر سوالی درباره پرداخت یا دریافت کانفیگ داری، همینجا بنویس.",
+            "📞 پیام پشتیبانی‌ات را بفرست.\nاگر سوالی درباره پرداخت یا دریافت کانفیگ داری، همینجا بنویس.",
             reply_markup=support_back_btn()
         )
         return
@@ -551,129 +553,85 @@ async def click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["plan_key"] = plan_key
 
         category = PLAN_CATEGORIES[cat_key]
-
-        await q.message.edit_text(
-            f"{category['title']}\n"
-            f"({category['subtitle']})\n\n"
-            f"✅ پلن انتخابی: {plan['name']}\n"
-            f"💰 مبلغ نهایی: {plan['price_usd']} USDT\n\n"
-            "لطفاً ارز پرداخت را انتخاب کن:",
-            reply_markup=currency_menu()
-        )
-        return
-
-    if data.startswith("pay_"):
-        pay_currency = data.split("_", 1)[1]
-        pay_currency_label = PAY_CURRENCIES.get(pay_currency, pay_currency)
-
-        plan_key = context.user_data.get("plan_key")
-        if not plan_key:
-            await q.message.reply_text("❌ اول پلن را انتخاب کن.")
-            return
-
-        category_key, plan = get_plan(plan_key)
-        if not plan:
-            await q.message.reply_text("❌ پلن پیدا نشد.")
-            return
-
-        if category_key == "eco" and not user_has_economy_access(q.from_user.id):
-            await q.message.reply_text("❌ دسترسی به این پکیج برای شما فعال نیست.")
-            return
-
         price_usd = str(plan["price_usd"])
         plan_name = plan["name"]
 
-        order_ref = f"TG-{q.from_user.id}-{random.randint(100000, 999999)}"
-        order_description = f"{PLAN_CATEGORIES[category_key]['title']} | {plan_name}"
-
         try:
-            payment = create_nowpayment(
-                price_amount=price_usd,
-                pay_currency=pay_currency,
+            order_ref = f"TG-{q.from_user.id}-{random.randint(100000, 999999)}"
+            description = f"{category['title']} | {plan_name}"
+
+            invoice = create_oxapay_invoice(
+                amount_usd=price_usd,
                 order_ref=order_ref,
-                order_description=order_description
+                description=description,
             )
+
+            track_id, payment_url = extract_invoice_fields(invoice)
+
+            if not track_id or not payment_url:
+                await q.message.reply_text("❌ ساخت لینک پرداخت ناموفق بود. دوباره تلاش کن.")
+                return
+
+            order_id = create_order(
+                user_id=q.from_user.id,
+                category_key=cat_key,
+                plan_key=plan_key,
+                plan_name=plan_name,
+                price_usd=price_usd,
+                track_id=track_id,
+                payment_url=payment_url,
+            )
+
+            await q.message.edit_text(
+                f"{category['title']}\n"
+                f"({category['subtitle']})\n\n"
+                f"📦 پلن: {plan_name}\n"
+                f"💰 مبلغ نهایی: {price_usd} USD\n"
+                f"🧾 Track ID: {track_id}\n\n"
+                "برای پرداخت روی دکمه زیر بزن تا صفحه پرداخت حرفه‌ای باز شود.\n"
+                "بعد از پرداخت، ربات به‌صورت خودکار وضعیت را بررسی می‌کند.",
+                reply_markup=pay_method_menu(order_id, payment_url)
+            )
+
         except requests.HTTPError as e:
-            logger.exception("NOWPayments create payment failed")
+            logger.exception("OxaPay invoice create failed")
             detail = ""
             try:
                 detail = e.response.text
             except Exception:
                 pass
-            await q.message.reply_text(
-                "❌ ساخت لینک پرداخت ناموفق بود.\n"
-                "اگر این خطا تکرار شد، ارز دیگری را انتخاب کن یا به پشتیبانی پیام بده."
-            )
+
+            await q.message.reply_text("❌ ساخت لینک پرداخت ناموفق بود. بعداً دوباره تلاش کن.")
             if detail:
                 await context.bot.send_message(
                     ADMIN,
-                    f"⚠️ خطا در ساخت پرداخت NOWPayments\nUser: {q.from_user.id}\n{detail}"
+                    f"⚠️ خطا در ساخت invoice اوکساپی\nUser: {q.from_user.id}\n{detail}"
                 )
             return
         except Exception as e:
-            logger.exception("Unexpected create payment error")
-            await q.message.reply_text("❌ خطا در ارتباط با درگاه پرداخت. دوباره تلاش کن.")
+            logger.exception("Unexpected OxaPay error")
+            await q.message.reply_text("❌ خطا در ارتباط با درگاه پرداخت.")
             await context.bot.send_message(
                 ADMIN,
-                f"⚠️ خطا در ساخت پرداخت\nUser: {q.from_user.id}\n{e}"
+                f"⚠️ خطای غیرمنتظره در ساخت invoice\nUser: {q.from_user.id}\n{e}"
             )
             return
-
-        np_payment_id = str(payment.get("payment_id", ""))
-        pay_address = payment.get("pay_address", "")
-        pay_amount = str(payment.get("pay_amount", ""))
-        payin_extra_id = payment.get("payin_extra_id") or payment.get("payin_extra_id_name") or ""
-
-        if not np_payment_id or not pay_address or not pay_amount:
-            await q.message.reply_text("❌ اطلاعات پرداخت ناقص برگشت داده شد. دوباره تلاش کن.")
-            return
-
-        order_id = create_order(
-            user_id=q.from_user.id,
-            category_key=category_key,
-            plan_key=plan_key,
-            plan_name=plan_name,
-            price_usd=price_usd,
-            pay_currency=pay_currency,
-            pay_currency_label=pay_currency_label,
-            np_payment_id=np_payment_id,
-            pay_address=pay_address,
-            pay_amount=pay_amount,
-            payin_extra_id=payin_extra_id,
-        )
-
-        extra_line = f"\n🧷 Memo / Tag: {payin_extra_id}" if payin_extra_id else ""
-
-        await q.message.edit_text(
-            "✅ پرداخت ساخته شد\n\n"
-            f"📦 پلن: {plan_name}\n"
-            f"💳 ارز انتخابی: {pay_currency_label}\n"
-            f"💰 مبلغ قابل پرداخت: {pay_amount} {pay_currency.upper()}\n"
-            f"🏷 مبلغ پلن: {price_usd} USDT\n\n"
-            "📍 آدرس پرداخت:\n"
-            f"{pay_address}"
-            f"{extra_line}\n\n"
-            "بعد از پرداخت، ربات به‌صورت خودکار وضعیت را بررسی می‌کند.\n"
-            "اگر خواستی، دکمه بررسی وضعیت را هم بزن.",
-            reply_markup=post_payment_buttons(order_id)
-        )
         return
 
     if data.startswith("checkpay_"):
         order_id = int(data.split("_", 1)[1])
         order = get_order_by_id(order_id)
-
         if not order:
             await q.message.reply_text("❌ سفارش پیدا نشد.")
             return
 
-        np_payment_id = order[8]
-        current_status = order[9]
+        track_id = order[6]
+        current_status = order[8]
 
         if current_status in FINAL_SUCCESS_STATUSES:
             state = get_order_notification_state(order_id)
             if state:
-                _, _, _, _, _, code, _ = state
+                _, _, _, _, code, _ = state
                 await q.message.reply_text(
                     "✅ این پرداخت قبلاً تایید شده است.\n\n"
                     f"🎫 Ticket ID: {code}\n"
@@ -683,30 +641,29 @@ async def click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            payment_data = get_nowpayment_status(np_payment_id)
-            status = payment_data.get("payment_status", "waiting")
-            update_order_status(order_id, status)
+            info = get_oxapay_payment_info(track_id)
+            payment_status = extract_status(info)
+            update_order_status(order_id, payment_status)
         except Exception:
-            await q.message.reply_text(
-                "⏳ هنوز نتیجه قطعی دریافت نشد.\n"
-                "کمی بعد دوباره بررسی کن."
-            )
+            await q.message.reply_text("⏳ هنوز نتیجه قطعی دریافت نشد. کمی بعد دوباره بررسی کن.")
             return
 
-        if status in FINAL_SUCCESS_STATUSES:
+        if payment_status in FINAL_SUCCESS_STATUSES:
             await finalize_paid_order(order_id, context)
             return
 
         status_texts = {
+            "new": "جدید",
             "waiting": "در انتظار پرداخت",
             "confirming": "در حال تایید شبکه",
-            "partially_paid": "بخشی از مبلغ پرداخت شده",
+            "paying": "پرداخت در حال انجام",
             "failed": "ناموفق",
-            "expired": "منقضی شده",
+            "expired": "منقضی‌شده",
+            "cancelled": "لغوشده",
         }
 
         await q.message.reply_text(
-            f"🔄 وضعیت فعلی پرداخت: {status_texts.get(status, status)}"
+            f"🔄 وضعیت فعلی پرداخت: {status_texts.get(payment_status, payment_status)}"
         )
         return
 
@@ -716,7 +673,7 @@ async def finalize_paid_order(order_id: int, context: ContextTypes.DEFAULT_TYPE)
     if not state:
         return
 
-    user_id, plan_name, price_usd, pay_currency_label, status, code, is_notified = state
+    user_id, plan_name, price_usd, status, code, is_notified = state
 
     if is_notified:
         return
@@ -729,7 +686,7 @@ async def finalize_paid_order(order_id: int, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(
             user_id,
             "✅ پرداخت شما با موفقیت تایید شد\n\n"
-            f"🎫 Ticket ID: {code}\n"
+            f"🎫 Ticket ID: {code}\n\n"
             "برای دریافت کانفیگ، لطفاً از بخش پشتیبانی به ما پیام بده.",
             reply_markup=success_support_button()
         )
@@ -740,8 +697,7 @@ async def finalize_paid_order(order_id: int, context: ContextTypes.DEFAULT_TYPE)
             f"🆔 Order ID: {order_id}\n"
             f"👤 User ID: {user_id}\n"
             f"📦 پلن: {plan_name}\n"
-            f"💰 مبلغ: {price_usd} USDT\n"
-            f"💳 ارز پرداخت: {pay_currency_label}\n"
+            f"💰 مبلغ: {price_usd} USD\n"
             f"📌 وضعیت: {status}\n"
             f"🎫 Ticket ID: {code}"
         )
@@ -757,10 +713,10 @@ async def payment_watcher(context: ContextTypes.DEFAULT_TYPE):
         return
 
     for row in rows:
-        order_id, user_id, plan_name, price_usd, pay_currency, pay_currency_label, np_payment_id, old_status, order_code, is_notified = row
+        order_id, user_id, plan_name, price_usd, track_id, old_status, order_code, is_notified = row
         try:
-            payment_data = get_nowpayment_status(np_payment_id)
-            new_status = payment_data.get("payment_status", old_status)
+            info = get_oxapay_payment_info(track_id)
+            new_status = extract_status(info)
 
             if new_status != old_status:
                 update_order_status(order_id, new_status)
@@ -818,10 +774,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if uid == ADMIN and context.user_data.get("reply_to"):
         target_id = context.user_data["reply_to"]
-        await context.bot.send_message(
-            target_id,
-            f"📩 پاسخ پشتیبانی:\n\n{text}"
-        )
+        await context.bot.send_message(target_id, f"📩 پاسخ پشتیبانی:\n\n{text}")
         await update.message.reply_text("✅ پاسخ برای مشتری ارسال شد.")
         context.user_data.pop("reply_to", None)
         return
@@ -866,8 +819,7 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "برای خرید نیازی به ارسال عکس فیش نیست.\n"
-        "اگر سوالی داری از بخش پشتیبانی پیام بده.",
+        "برای خرید نیازی به ارسال عکس فیش نیست.\nاگر سوالی داری از بخش پشتیبانی پیام بده.",
         reply_markup=main_menu()
     )
 
@@ -886,7 +838,7 @@ def main():
     app.job_queue.run_repeating(payment_watcher, interval=60, first=20)
 
     print("Bot is running...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
