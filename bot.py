@@ -2,10 +2,12 @@ import sqlite3
 import random
 import string
 import logging
+import threading
 from decimal import Decimal
 from typing import Optional, Tuple
 
 import requests
+from flask import Flask, request, jsonify
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -27,12 +29,17 @@ from telegram.ext import (
 
 TOKEN = "8762120219:AAHeN_DjtVvn5QI1R6pTHC_4qobtnXVgTy4"
 ADMIN = 33872273
-OXAPAY_MERCHANT_API_KEY = "T3WZ58-ZVMEA7-CFBDPD-UIOKGI"
+OXAPAY_MERCHANT_API_KEY = "AUY80X-QAAJUL-T5ZYCC-WA7T2V"
 BOT_USERNAME = "iranconnect_bot"
 
 DB_PATH = "bot_data.db"
+PORT = 8080
+
 OXAPAY_BASE = "https://api.oxapay.com/v1"
 ECONOMY_ACCESS_CODE = "netazadi_eghtesadi"
+
+# این مسیر callback مخفیه
+CALLBACK_PATH = "/oxa_payhook_83921"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -69,6 +76,7 @@ PLAN_CATEGORIES = {
 
 FINAL_SUCCESS_STATUSES = {"paid"}
 FAILED_STATUSES = {"failed", "expired", "cancelled"}
+
 
 # =========================
 # DB
@@ -252,6 +260,18 @@ def update_order_status(order_id: int, status: str):
     conn.close()
 
 
+def update_order_status_by_track_id(track_id: str, status: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE orders
+        SET payment_status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE track_id = ?
+    """, (status, track_id))
+    conn.commit()
+    conn.close()
+
+
 def set_order_success(order_id: int, status: str, code: str):
     conn = db()
     cur = conn.cursor()
@@ -309,7 +329,7 @@ def welcome_text():
     return (
         "🌐 به ربات رسمی نت‌آزادی خوش اومدی\n\n"
         "✨ خرید سریع و امن پلن‌های VPN\n"
-        "💎 پرداخت با رمزارزها\n"
+        "💎 پرداخت با کریپتوکارنسی (رمزارزها)\n"
         "🤖 تایید خودکار پرداخت\n"
         "🎫 دریافت Ticket ID بعد از پرداخت\n\n"
         "برای شروع از منوی پایین استفاده کن 👇"
@@ -380,10 +400,6 @@ def get_plan(plan_key: str) -> Tuple[Optional[str], Optional[dict]]:
     return cat_key, PLAN_CATEGORIES[cat_key]["plans"][plan_key]
 
 
-def return_url():
-    return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else None
-
-
 def extract_invoice_fields(resp_json: dict) -> Tuple[str, str]:
     data = resp_json.get("data") if isinstance(resp_json.get("data"), dict) else resp_json
     track_id = data.get("track_id") or data.get("trackId") or ""
@@ -395,6 +411,34 @@ def extract_status(resp_json: dict) -> str:
     data = resp_json.get("data") if isinstance(resp_json.get("data"), dict) else resp_json
     status = data.get("status", "new")
     return str(status).lower()
+
+
+def extract_track_id_from_callback(payload: dict) -> str:
+    possible = [
+        payload.get("track_id"),
+        payload.get("trackId"),
+        payload.get("invoice_track_id"),
+    ]
+    if isinstance(payload.get("data"), dict):
+        possible.extend([
+            payload["data"].get("track_id"),
+            payload["data"].get("trackId"),
+            payload["data"].get("invoice_track_id"),
+        ])
+    for item in possible:
+        if item:
+            return str(item)
+    return ""
+
+
+def extract_callback_status(payload: dict) -> str:
+    possible = [payload.get("status")]
+    if isinstance(payload.get("data"), dict):
+        possible.append(payload["data"].get("status"))
+    for item in possible:
+        if item:
+            return str(item).lower()
+    return "new"
 
 
 # =========================
@@ -414,16 +458,12 @@ def create_oxapay_invoice(amount_usd: str, order_ref: str, description: str):
         "currency": "USD",
         "lifetime": 60,
         "fee_paid_by_payer": 1,
-        "mixed_payment": True,
-        "return_url": return_url(),
-        "thanks_message": "Thanks for your payment!",
+        "mixed_payment": False,
+        "thanks_message": "پرداخت شما با موفقیت انجام شد ✅ لطفاً به ربات برگردید و وضعیت پرداخت را بررسی کنید.",
         "description": description,
         "order_id": order_ref,
         "sandbox": False,
     }
-
-    if not payload["return_url"]:
-        payload.pop("return_url", None)
 
     r = requests.post(
         f"{OXAPAY_BASE}/payment/invoice",
@@ -443,6 +483,40 @@ def get_oxapay_payment_info(track_id: str):
     )
     r.raise_for_status()
     return r.json()
+
+
+# =========================
+# FLASK CALLBACK SERVER
+# =========================
+
+web_app = Flask(__name__)
+
+
+@web_app.get("/")
+def home():
+    return "vpn-bot webhook server is running", 200
+
+
+@web_app.post(CALLBACK_PATH)
+def oxapay_callback():
+    try:
+        payload = request.get_json(silent=True) or {}
+        track_id = extract_track_id_from_callback(payload)
+        status = extract_callback_status(payload)
+
+        logger.info("OxaPay callback received | track_id=%s | status=%s | payload=%s", track_id, status, payload)
+
+        if track_id and status:
+            update_order_status_by_track_id(track_id, status)
+
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        logger.exception("Callback error: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def run_web_server():
+    web_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
 # =========================
@@ -549,9 +623,6 @@ async def click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("❌ دسترسی به این پکیج برای شما فعال نیست.")
             return
 
-        context.user_data["category"] = cat_key
-        context.user_data["plan_key"] = plan_key
-
         category = PLAN_CATEGORIES[cat_key]
         price_usd = str(plan["price_usd"])
         plan_name = plan["name"]
@@ -588,8 +659,8 @@ async def click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📦 پلن: {plan_name}\n"
                 f"💰 مبلغ نهایی: {price_usd} USD\n"
                 f"🧾 Track ID: {track_id}\n\n"
-                "برای پرداخت روی دکمه زیر بزن تا صفحه پرداخت حرفه‌ای باز شود.\n"
-                "بعد از پرداخت، ربات به‌صورت خودکار وضعیت را بررسی می‌کند.",
+                "برای پرداخت روی دکمه زیر بزن.\n"
+                "بعد از پرداخت، ربات خودش وضعیت را بررسی می‌کند.",
                 reply_markup=pay_method_menu(order_id, payment_url)
             )
 
@@ -601,7 +672,7 @@ async def click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            await q.message.reply_text("❌ ساخت لینک پرداخت ناموفق بود. بعداً دوباره تلاش کن.")
+            await q.message.reply_text("❌ ساخت لینک پرداخت ناموفق بود. دوباره تلاش کن.")
             if detail:
                 await context.bot.send_message(
                     ADMIN,
@@ -827,6 +898,9 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
 
+    flask_thread = threading.Thread(target=run_web_server, daemon=True)
+    flask_thread.start()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -835,7 +909,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
 
-    app.job_queue.run_repeating(payment_watcher, interval=60, first=20)
+    app.job_queue.run_repeating(payment_watcher, interval=20, first=10)
 
     print("Bot is running...")
     app.run_polling(drop_pending_updates=True)
